@@ -1,0 +1,241 @@
+-- SecureMoneyAndXP.lua (ServerScriptService)
+-- Server-authoritative money & XP per second with DataStore and basic anti-tamper checks.
+-- Use only in games you own. Do NOT use to cheat in other people's games.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local DataStoreService = game:GetService("DataStoreService")
+
+-- CONFIG
+local MONEY_PER_SECOND = 300
+local EXP_PER_SECOND = 1000
+local TICK_INTERVAL = 1
+local DATASTORE_NAME = "MyGame_PlayerData_v1"
+local SAVE_INTERVAL = 60 -- seconds
+local MAX_LEGAL_DELTA = 1e6 -- if player's Money/XP jumps more than this in one tick, it's suspicious
+
+-- Admins (Roblox UserIds) that can use the server-side admin command below.
+local ADMIN_USERIDS = {
+    [12345678] = true, -- replace with your user id(s)
+}
+
+-- DataStore handle
+local store = DataStoreService:GetDataStore(DATASTORE_NAME)
+
+-- Per-player runtime state
+local playerState = {} -- player -> {moneyValue, xpValue, lastSavedAt, lastSnapshot = {money, xp}}
+
+-- Utility: create leaderstats safely
+local function setupLeaderstats(player)
+    local leaderstats = Instance.new("Folder")
+    leaderstats.Name = "leaderstats"
+    leaderstats.Parent = player
+
+    local money = Instance.new("IntValue")
+    money.Name = "Money"
+    money.Value = 0
+    money.Parent = leaderstats
+
+    local xp = Instance.new("IntValue")
+    xp.Name = "XP"
+    xp.Value = 0
+    xp.Parent = leaderstats
+
+    return money, xp
+end
+
+-- DataStore wrappers with retries
+local function safePcall(fn, ...)
+    local success, result = pcall(fn, ...)
+    if success then return true, result end
+    return false, result
+end
+
+local function savePlayerData(player, moneyVal, xpVal)
+    local key = "player_" .. player.UserId
+    local attempt = 0
+    while attempt < 5 do
+        attempt = attempt + 1
+        local ok, err = safePcall(function()
+            store:SetAsync(key, {money = moneyVal, xp = xpVal})
+        end)
+        if ok then return true end
+        wait(1 + attempt) -- backoff
+    end
+    warn("Failed to save data for", player.Name)
+    return false
+end
+
+local function loadPlayerData(player)
+    local key = "player_" .. player.UserId
+    local attempt = 0
+    while attempt < 5 do
+        attempt = attempt + 1
+        local ok, data = safePcall(function()
+            return store:GetAsync(key)
+        end)
+        if ok then
+            if type(data) == "table" then
+                return data
+            else
+                return nil
+            end
+        end
+        wait(1 + attempt)
+    end
+    warn("Failed to load data for", player.Name)
+    return nil
+end
+
+-- Anti-tamper: check whether values jumped suspiciously (manual client hack attempts)
+local function isSuspiciousDelta(prev, current, allowedDelta)
+    if type(prev) ~= "number" or type(current) ~= "number" then
+        return true
+    end
+    local delta = current - prev
+    if delta < 0 then
+        -- sudden negative (someone tampered?) treat as suspicious but allow if necessary
+        return math.abs(delta) > allowedDelta
+    end
+    return delta > allowedDelta
+end
+
+-- Initialize player
+Players.PlayerAdded:Connect(function(player)
+    local moneyVal, xpVal = setupLeaderstats(player)
+    playerState[player] = {
+        money = moneyVal,
+        xp = xpVal,
+        lastSavedAt = os.time(),
+        lastSnapshot = {money = 0, xp = 0},
+        accumulatedTickSeconds = 0,
+    }
+
+    -- Load persistent data
+    local data = loadPlayerData(player)
+    if data then
+        moneyVal.Value = math.max(0, math.floor(data.money or 0))
+        xpVal.Value = math.max(0, math.floor(data.xp or 0))
+        playerState[player].lastSnapshot.money = moneyVal.Value
+        playerState[player].lastSnapshot.xp = xpVal.Value
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    local state = playerState[player]
+    if state then
+        -- Save on leave
+        savePlayerData(player, state.money.Value, state.xp.Value)
+        playerState[player] = nil
+    end
+end)
+
+-- Server-authoritative grant function (internal)
+local function grantFromServer(player, moneyAmount, xpAmount)
+    local state = playerState[player]
+    if not state then return end
+    if moneyAmount ~= 0 then
+        state.money.Value = state.money.Value + math.floor(moneyAmount)
+    end
+    if xpAmount ~= 0 then
+        state.xp.Value = state.xp.Value + math.floor(xpAmount)
+    end
+end
+
+-- Admin server command (server-side only): grants amounts immediately
+local function adminGrant(player, moneyAmount, xpAmount)
+    if not ADMIN_USERIDS[player.UserId] then
+        warn("Unauthorized adminGrant attempt by", player.Name)
+        return
+    end
+    grantFromServer(player, moneyAmount, xpAmount)
+end
+
+-- RemoteEvent for client -> server requests (e.g., request notification, or client asking for current stats).
+-- IMPORTANT: do NOT provide a Remote that allows clients to add money/xp. Any client requests must be validated.
+local remoteFolder = Instance.new("Folder")
+remoteFolder.Name = "SecureRemotes"
+remoteFolder.Parent = script
+
+local requestRemote = Instance.new("RemoteEvent")
+requestRemote.Name = "RequestServerAction"
+requestRemote.Parent = remoteFolder
+
+-- Handle client requests (example: client can request a 'status' ping; other actions must be validated)
+requestRemote.OnServerEvent:Connect(function(player, action, payload)
+    -- action is a string that defines allowed operations; validate strictly
+    if action == "ping" then
+        -- respond with a small confirmation via fireclient (could be used for UI)
+        requestRemote:FireClient(player, "pong", {serverTime = os.time()})
+        return
+    elseif action == "adminGrant" then
+        -- ONLY allow admins and only numeric safe payloads
+        if not ADMIN_USERIDS[player.UserId] then return end
+        local moneyAmount = tonumber(payload and payload.money) or 0
+        local xpAmount = tonumber(payload and payload.xp) or 0
+        adminGrant(player, moneyAmount, xpAmount)
+        return
+    end
+    -- unknown action -> ignore
+end)
+
+-- Main tick loop: award money and xp to each connected player
+spawn(function()
+    local accum = 0
+    while RunService:IsRunning() do
+        local start = tick()
+        wait(TICK_INTERVAL)
+        local elapsed = tick() - start
+        for player, state in pairs(playerState) do
+            if player and player.Parent and state and state.money and state.xp then
+                -- Award server-authoritative amounts
+                local moneyToAdd = math.floor(MONEY_PER_SECOND * elapsed)
+                local xpToAdd = math.floor(EXP_PER_SECOND * elapsed)
+
+                -- Before writing, do anti-tamper checks: compare with snapshot
+                local prevMoney = state.lastSnapshot.money or state.money.Value
+                local prevXP = state.lastSnapshot.xp or state.xp.Value
+                local curMoney = state.money.Value
+                local curXP = state.xp.Value
+
+                -- If the player manually changed their Money/XP (client exploit), we detect suspicious jumps
+                if isSuspiciousDelta(prevMoney, curMoney, MAX_LEGAL_DELTA) or isSuspiciousDelta(prevXP, curXP, MAX_LEGAL_DELTA) then
+                    -- Log and rollback to the safe snapshot
+                    warn("Suspicious stat change detected for", player.Name,
+                         " snapshotMoney=", prevMoney, "curMoney=", curMoney,
+                         " snapshotXP=", prevXP, "curXP=", curXP)
+                    -- Rollback to snapshot (server authoritative)
+                    state.money.Value = prevMoney
+                    state.xp.Value = prevXP
+                    -- Optionally: increment a strike counter, kick player, or flag for review
+                    -- For demonstration we just warn and rollback.
+                else
+                    -- Apply legitimate server grants
+                    state.money.Value = state.money.Value + moneyToAdd
+                    state.xp.Value = state.xp.Value + xpToAdd
+
+                    -- Update snapshot after applying increments
+                    state.lastSnapshot.money = state.money.Value
+                    state.lastSnapshot.xp = state.xp.Value
+                end
+
+                -- Periodic autosave
+                if os.time() - state.lastSavedAt >= SAVE_INTERVAL then
+                    state.lastSavedAt = os.time()
+                    savePlayerData(player, state.money.Value, state.xp.Value)
+                end
+            end
+        end
+    end
+end)
+
+-- Optional: Scheduled full save (server shutdown safety)
+game:BindToClose(function()
+    for player, state in pairs(playerState) do
+        if state and state.money and state.xp then
+            savePlayerData(player, state.money.Value, state.xp.Value)
+        end
+    end
+end)
+
+print("SecureMoneyAndXP loaded.")
